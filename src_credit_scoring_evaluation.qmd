@@ -1,0 +1,604 @@
+---
+title: "Práctica 2. Evaluación de un Modelo de Clasificación"
+subtitle: "Técnicas Avanzadas de Predicción en Negocios"
+author: "Teresa Gento Padilla y Mario Martínez Escrivá"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc-title: "Tabla de contenidos"
+    theme: cerulean
+    fontsize: 1.1em
+    linestretch: 1.5
+
+editor: visual
+---
+
+```{=html}
+<style>
+body {
+  text-align: justify;
+}
+</style>
+```
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+libs <- c("tidyverse", "C50", "gmodels", "caret", "ROCR", "knitr", "kableExtra", "patchwork" )
+
+installed_libs <- libs %in% rownames(installed.packages())
+
+if (any(installed_libs == F)) {install.packages(libs[!installed_libs])}
+
+invisible(lapply(libs, library, character.only = T))
+
+rm(libs, installed_libs)
+
+options(scipen = 999)
+
+creditos <- read.csv("http://www.uv.es/pavia/MCD/credit.csv", sep=";", stringsAsFactors = TRUE)
+
+```
+
+## Introducción
+
+Este informe tiene como objetivo realizar un análisis de credit scoring para evaluar la viabilidad de conceder un crédito, basado en la probabilidad de incumplimiento calculada mediante un modelo de clasificación. Como parte del ejercicio, se desarrollarán y compararán varios modelos para obtener los resultados más satisfactorios.
+
+## Datos
+
+La base de datos utilizada contiene información de 1000 préstamos, con un total de 21 variables que incluyen tanto datos categóricos como numéricos. Estas variables describen las características de los préstamos y de los prestatarios en el contexto de microcréditos de alto riesgo.
+
+## Análisis Exploratorio
+
+Como paso previo a la implementación de los modelos de clasificación conviene realizar un Análisis Exploratorio de los datos para comprenderlos mejor e identificar patrones, relaciones y posibles anomalías o valores atípicos. Esto nos permitirá solucionar problemas potenciales en la estructura y definición de los datos.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+
+creditos$checking_balance <- factor(creditos$checking_balance, 
+                                    levels = c("unknown", "< 0 DM", "1 - 200 DM", "> 200 DM"))
+
+creditos$savings_balance <- factor(creditos$savings_balance, 
+                                   levels = c("unknown", "< 100 DM", "101 - 500 DM", "501 - 1000 DM", "> 1000 DM"))
+
+```
+
+Un detalle importante es la significativa minoría de préstamos en *default*, lo cual puede generar un desbalance de clases y dificultar la identificación precisa de estos casos. Los modelos podrían inclinarse hacia la clase mayoritaria (*no-default*), aumentando la tasa de falsos negativos y el riesgo financiero para la entidad crediticia.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+kable(table(creditos$default), caption = "Distribución de Default en Créditos")
+```
+
+En el caso del saldo en la cuenta corriente, la distribución de observaciones es bastante equilibrada en casi todos los niveles de saldo, excepto en el nivel de cuentas con más de 200 DM, donde solo hay 63 observaciones.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+kable(table(creditos$checking_balance), caption = "Distribución de Saldo en Cuenta Corriente")
+```
+
+La distribución del saldo en la cuenta de ahorros es menos diversa que en la cuenta corriente, el 60% de las cuentas tienen un saldo inferior a 100 DM, y apenas el 20% supera esa cantidad.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+kable(table(creditos$savings_balance), caption = "Distribución de Saldo en Cuenta de Ahorros")
+
+```
+
+Si se compara en términos porcentuales la proporción de saldo en la cuenta corriente y en la cuenta de ahorros en préstamos con *Default* y *No-Default,* parece haber una mayoría de préstamos con valores bajos en aquellos préstamos con *Default*. Sin embargo, en términos absolutos, las cifras de préstamos con *No-default* son más altas en todos los casos. Por lo que habrá que ver cómo clasifican los modelos a continuación en función de todas las demás variables, no únicamente estas dos.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+p1 <- ggplot(creditos, aes(x = default, fill = checking_balance)) +
+  geom_bar(position = "fill") +
+  labs(title = "Checking Balance vs Default", y = "Proportion", x = "Default") +
+  scale_fill_brewer(palette = "Blues", name = "Checking Balance") +
+  theme_minimal()
+
+# Gráfico 2: Savings Balance vs Default
+p2 <- ggplot(creditos, aes(x = default, fill = savings_balance)) +
+  geom_bar(position = "fill") +
+  labs(title = "Savings Balance vs Default", y = "Proportion", x = "Default") +
+  scale_fill_brewer(palette = "Reds", name = "Savings Balance") +
+  theme_minimal()
+
+# Mostrar ambos gráficos en una cuadrícula
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+```
+
+## Algoritmo de predicción
+
+Para esta tarea, se buscará un algoritmo de clasificación interpretable, en concreto, árboles de decisión basados en el algoritmo C5.0. No obstante, el enfoque principal no será tanto el modelo en sí, sino su evaluación y comparación.
+
+### Modelo 1. Por defecto
+
+El primer modelo que se evaluará aplicará las configuraciones predeterminadas del algoritmo sobre la base de datos.
+
+#### Estimación del Modelo
+
+Para la estimación del modelo se utilizará un conjunto de entrenamiento con el 90% de los datos, frente a un conjunto de test del 10% de la muestra. Aunque la baja representatividad de préstamos con Default podría llegar a resultar un inconveniente en el entrenamiento y posterior predicción, a priori, la distribución de las clases es similar en ambos conjuntos como se puede observar en las dos tablas a continuación.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Creamos conjuntos de entrenamiento (90%) y de test (10%)
+set.seed(11111) # Fijamos semilla
+credit <- creditos[sample(1:1000),]
+train <- credit[1:900,]
+test <- credit[901:1000,]
+
+# Reparto
+kable(prop.table(table(train$default)), caption = "Proporción Default - No Default en el Training Set")
+
+kable(prop.table(table(test$default)), caption = "Proporción Default - No Default en el Test Set")
+
+
+# Entrenamos el modelo
+set.seed(11111) # Fijamos semilla
+modelo1 <- C5.0(subset(train, select = -default), train$default)
+
+```
+
+Tras esto, se entrena el modelo excluyendo la variable de respuesta (`default`).
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+prediccion_train <- predict(modelo1, train)
+
+CrossTable(train$default, prediccion_train, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+```
+
+La matriz de confusión indica que el modelo clasifica correctamente cerca del 90% de los casos en el conjunto usado para el entrenamiento. Sin embargo, destaca el hecho de que 63 observaciones fueron clasificadas como *No-Default* cuando en realidad correspondían a casos de *Default*. Esto sugiere que el modelo podría estar sesgado hacia la clase mayoritaria (*No-Default*), probablemente debido a la baja representatividad de préstamos en *Default*.
+
+#### Evaluación del Modelo
+
+A la hora de evaluar el modelo, es importante tener en mente que la precisión esperanzada al clasificar por azar es de un 58%. Por lo que no tendrá sentido aceptar un modelo con una precisión inferior a esta.
+
+::: {.callout-note collapse="true" appearance="minimal"}
+## Fórmula para calcular precisión esperada por azar
+
+$$
+E(accuracy) = P(A)^2 + P(B)^2 = (0.3)^2 + (0.7)^2 = 0.58
+$$
+:::
+
+**Matriz de confusión**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+prediccion_test <- predict(modelo1, test) 
+
+CrossTable(test$default, prediccion_test, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+
+```
+
+**Medidas de evaluación**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+cm.mod1 <- confusionMatrix(prediccion_test , test$default, 
+                positive = "Si-Default")
+
+cm.mod1
+
+```
+
+El modelo clasifica correctamente 67 casos (54 No-Default y 13 Default) de un total de 100 observaciones, lo que implica una exactitud del 67%, solo un 9% superior a la precisión esperada al clasificar aleatoriamente (58%). Aunque esto muestra que el modelo tiene un rendimiento mejor que el azar, la mejora es modesta.
+
+De los 68 casos reales de *No-Default*, el modelo clasifica 54 correctamente, mientras que 14 fueron incorrectamente clasificados como *Default*. Esto equivale a una tasa de error en la clase *No-Default* de aproximadamente el 20.6%. En contrapartida, la especificidad del 79.4% muestra que el modelo es eficaz para identificar los casos de *no default*, algo esperado dada la mayor proporción de estos casos en la base de datos.
+
+De los 32 casos reales de *Default*, el modelo clasifica correctamente solo 13 y erróneamente a 19, lo que implica una tasa de error en la clase Default de aproximadamente 59.4%. La sensibilidad o recall para esta clase es de 13/32 ≈ 0.406, lo que significa que el modelo solo captura el 40.6% de los casos reales de Default, un valor bastante bajo.
+
+La precisión de 48.1% indica que menos de la mitad de las predicciones positivas son correctas, lo cual revela una alta tasa de falsos positivos y sugiere que el modelo tiende a clasificar incorrectamente préstamos como *No-default*. Este sesgo hacia la clase mayoritaria muestra una baja sensibilidad para la clase Default y muchos problemas en la detección de estos casos.
+
+Un valor de Kappa de 0.209 indica un acuerdo bajo entre las predicciones y los valores reales, una señal de que el modelo apenas supera el azar en su clasificación y no es robusto en cuanto a identificar correctamente los préstamos en *default*.
+
+El F-Score de 0.441 refleja un balance bajo entre precisión y *recall*, confirmando que el modelo no es adecuado para predecir préstamos en *Default*, ya que tiene dificultades en captar correctamente los casos positivos.
+
+El Área Bajo la Curva ROC de 0.557 es apenas mejor que el azar (0.5), lo cual indica una capacidad de discriminación muy baja entre las clases *Default* y *No-Default*.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+prob_test <- predict(modelo1, test, type = 'prob') 
+
+# Crear el objeto prediction con las predicciones sobre el conjunto de test
+pred <- prediction(predictions = prob_test[,2], labels = test$default)  
+
+# Extraer TPR y FPR para la curva ROC
+perf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+
+# Convertir los valores en un data frame para graficar
+roc_data <- data.frame(fpr = unlist(perf@x.values),   
+                        tpr = unlist(perf@y.values)) 
+
+# Graficar la curva ROC con ggplot2
+ggplot(roc_data, aes(x = fpr, y = tpr)) +   
+  geom_line(color = "royalblue3", linewidth = 1.1) +   
+  geom_abline(linewidth = 1.1, slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +   
+  labs(title = "Curva ROC del Modelo por defecto", x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)") +   
+  theme_light() 
+
+```
+
+En resumen, se podría decir que, aunque este modelo es mejor que una mera clasificación al azar, su mejora con respecto a esta no es muy significativa. Muestra un sesgo hacia la clase mayoritaria que hace clasificar como érroneamente más de la mitad de préstamos Default. Esto dentro del contexto en el que nos encontramos supone una pérdida económica para la entidad financiera más que significativa.
+
+### Modelo 2 y 3. Boosting
+
+Viendo los resultados del modelo anterior, se tratará de mejorar aplicando en este caso un algoritmo de boosting. Para ver si un mayor número de pruebas mejora las predicciones o si genera problemas de sobreajuste, se crearán dos modelos con 10 y 50 pruebas respectivamente.
+
+#### Estimación de los Modelos
+
+Al igual que en el primer modelo, se utilizará un conjunto de entrenamiento con el 90% de la base de datos y un conjunto de test con el 10% restante. Como se ha comentado anteriormente, el primer modelo utilizará un algoritmo de boosting con 10 trials (pruebas) y el segundo con 50 trials.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Boosting the model
+set.seed(12345)
+modelo_boost10 <- C5.0(subset(train, select = -default),
+                       train$default, trials = 10)
+
+# Modelo con boosting y 10 trials
+modelo_boost_10 <- C5.0(subset(train, select = -default), train$default, trials = 10)
+
+prediccion_10 <- predict(modelo_boost_10, test)
+
+
+# Modelo con boosting y 50 trials
+modelo_boost_50 <- C5.0(subset(train, select = -default), train$default, trials = 50)
+
+prediccion_50 <- predict(modelo_boost_50, test)
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+prediccion_train2 <- predict(modelo_boost_10, train)
+
+CrossTable(train$default, prediccion_train2, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+
+
+prediccion_train3 <- predict(modelo_boost_50, train)
+
+CrossTable(train$default, prediccion_train3, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+```
+
+A priori, ambos modelos predictivos parecen presentar overfitting sobre el conjunto de entrenamiento, con tan solo 3 errores en el primer modelo y ninguno en el segundo.
+
+#### Evaluación del Modelo
+
+**Matriz de confusión Modelo con 10 trials**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+CrossTable(test$default, prediccion_10, prop.chisq = FALSE, 
+           prop.c = FALSE, prop.r = FALSE, dnn = c('REAL', 'PREDICCION'))
+
+```
+
+**Matriz de confusión Modelo con 50 trials**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+CrossTable(test$default, prediccion_50, prop.chisq = FALSE,             
+           prop.c = FALSE, prop.r = FALSE, dnn = c('REAL', 'PREDICCION')) 
+
+```
+
+**Medidas de evaluación Modelo con 10 trials**
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+cm.mod2 <- confusionMatrix(prediccion_10 , test$default,
+                           positive = "Si-Default")  
+cm.mod2
+
+```
+
+**Medidas de evaluación Modelo con 50 trials**
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+cm.mod3 <- confusionMatrix(prediccion_50 , test$default,
+                           positive = "Si-Default")  
+cm.mod3
+```
+
+El modelo con 10 trials clasifica correctamente 69 casos (53 No-Default y 16 Default) de un total de 100 observaciones, lo que implica una exactitud del 69%. Comparado con el modelo de 50 trials, que tiene una exactitud del 70%, el modelo con 10 pruebas es ligeramente inferior en precisión, aunque la diferencia es mínima (1%).
+
+De los 68 casos reales de No-Default, el modelo con 10 pruebas clasifica 53 correctamente, mientras que 15 fueron incorrectamente clasificados como Default. Esto equivale a una tasa de error en la clase No-Default de aproximadamente 22.1%. Comparativamente, el modelo de 50 trials clasifica correctamente 56 casos de No-Default y solo 12 incorrectamente como Default, logrando una tasa de error más baja en esta clase (17.6%). Esto sugiere que el modelo de 50 trials es más eficaz en la identificación de No-Default.
+
+De los 32 casos reales de Default, el modelo con 10 trials clasifica correctamente solo 16 y erróneamente clasifica otros 16 como No-Default, resultando en una tasa de error del 50% en la clase Default. En contraste, el modelo de 50 trials clasifica correctamente 14 casos de Default y erróneamente clasifica 18 como No-Default, elevando la tasa de error a 56.3% en esta clase.
+
+La precisión de 51.6% en el modelo de 10 pruebas sugiere que un poco más de la mitad de las predicciones de Default son correctas. Por su parte, el modelo de 50 tiene una precisión de 53.85%, lo que indica una mejora mínima en la precisión de las predicciones de Default. Sin embargo, ambos modelos muestran una alta tasa de falsos positivos y dificultades para diferenciar adecuadamente entre las clases.
+
+El valor de Kappa en el modelo con 10 trials es de 0.2817, mientras que en el modelo de 50 trials es de 0.2747, una diferencia mínima que indica que ninguno de los modelos tiene una concordancia sólida entre predicciones y valores reales. El acuerdo es igualmente bajo en ambos casos, sugiriendo que aumentar el número de trials no mejora significativamente la precisión global del modelo.
+
+El F-Score de 0.508 en el modelo de 10 trials muestra un balance moderado entre precisión y sensibilidad, mientras que el modelo con 50 trials tiene un F-Score ligeramente inferior de 0.49, lo que indica que el balance entre estos dos aspectos es marginalmente mejor en el modelo con menos trials.
+
+El Área Bajo la Curva (AUC) para el modelo de 10 ensayos es de aproximadamente 0.74, mientras que el modelo de 50 ensayos tiene un AUC de 0.75. Ambos modelos presentan una capacidad de discriminación similar y moderada entre las clases Default y No-Default, sin una mejora significativa al aumentar el número de ensayos.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Obtener las probabilidades de predicción sobre el conjunto de test
+prob_test2 <- predict(modelo_boost_10, test, type = 'prob') 
+
+# Crear el objeto prediction con las predicciones sobre el conjunto de test
+pred2 <- prediction(predictions = prob_test2[,2], labels = test$default)  
+
+# Extraer TPR y FPR para la curva ROC
+perf2 <- performance(pred2, measure = "tpr", x.measure = "fpr") 
+
+# Convertir los valores en un data frame para graficar
+roc_data2 <- data.frame(fpr = unlist(perf2@x.values),   
+                        tpr = unlist(perf2@y.values)) 
+
+# Graficar la curva ROC con ggplot2
+p1<- ggplot(roc_data2, aes(x = fpr, y = tpr)) +   
+  geom_line(color = "royalblue3", linewidth = 1.1) +   
+  geom_abline(linewidth = 1.1, slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +   
+  labs(title = "Curva ROC Modelo con 10 trials", x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)") +   
+  theme_light() 
+
+
+# Curva ROC para modelo 3
+
+# Obtener las probabilidades de predicción sobre el conjunto de test
+prob_test3 <- predict(modelo_boost_50, test, type = 'prob') 
+
+# Crear el objeto prediction con las predicciones sobre el conjunto de test
+pred3 <- prediction(predictions = prob_test3[,2], labels = test$default)  
+
+# Extraer TPR y FPR para la curva ROC
+perf3 <- performance(pred3, measure = "tpr", x.measure = "fpr") 
+
+# Convertir los valores en un data frame para graficar
+roc_data3 <- data.frame(fpr = unlist(perf3@x.values),   
+                        tpr = unlist(perf3@y.values)) 
+
+# Graficar la curva ROC con ggplot2
+p2 <- ggplot(roc_data3, aes(x = fpr, y = tpr)) +   
+  geom_line(color = "royalblue3", linewidth = 1.1) +   
+  geom_abline(linewidth = 1.1, slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +   
+  labs(title = "Curva ROC Modelo con 50 trials", x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)") +   
+  theme_light() 
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+```
+
+En líneas generales, podemos decir que aunque estos dos modelos mejoran la capacidad clasificatoria del primer modelo, se observa un marcado overfitting. Asímismo, entre los dos modelos de boosting no existe una gran diferencia, siendo ligeramente superior el modelo con menos trials.
+
+### Modelo 4. Sensible a costes
+
+#### Estimación del Modelo
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+error_cost <- matrix(c(0, 1, 4, 0), nrow = 2)
+
+# Modelos con costes de error asimetricos
+modelo_cost <- C5.0(subset(train, select = -default),
+                    train$default, costs = error_cost)
+
+# Predecimos con el modelo boosting
+prediccion_cost <- predict(modelo_cost, test)
+
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+prediccion_train4 <- predict(modelo_cost, train)
+
+CrossTable(train$default, prediccion_train4, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+
+```
+
+#### Evaluación del Modelo
+
+**Matriz de confusión**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+CrossTable(test$default, prediccion_cost, prop.chisq = FALSE,
+           prop.c = FALSE, prop.r = FALSE, 
+           dnn = c('REAL', 'PREDICCION'))
+
+```
+
+**Medidas de evaluación**
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+
+cm.mod4 <- confusionMatrix(prediccion_cost , test$default,
+                           positive = "Si-Default")  
+
+cm.mod4
+
+```
+
+Este modelo clasifica correctamente 64 casos (37 No-Default y 27 Default) de un total de 100 observaciones, lo que implica una exactitud del 64%. La precisión de este modelo es más baja que la de los otros tres, lo que implica que su rendimiento es algo menor en la clasificación general.
+
+De los 68 casos reales de No-Default, este modelo clasifica 37 correctamente, mientras que 31 fueron incorrectamente clasificados como Default, una tasa de error en la clase No-Default de aproximadamente 45.6%. La especificidad de este modelo, de 54.41%, es considerablemente menor que en los otros tres modelos, lo cual indica que tiene más dificultades para clasificar correctamente los casos de No-Default y presenta una tendencia a clasificarlos como Default.
+
+De los 32 casos reales de Default, el modelo clasifica correctamente 27 y erróneamente a solo 5 como No-Default, resultando en una tasa de error en la clase Default de 15.6% y una sensibilidad del 84.38%. Aunque este valor es una gran mejora en comparación con los otros tres modelos, esto resulta a costa de clasificar erróneamente casi la mitad de los casos de No-Default
+
+El valor Kappa de este modelo es de 0.3192, lo que indica una leve mejora en comparación con los otros modelos (cuyos valores de Kappa estaban entre 0.209 y 0.2817). El F-Score de 0.6 muestra también una mejora en el balance entre precisión y sensibilidad con respecto a los modelos anteriores.
+
+El Área Bajo la Curva ROC (AUC) es de 0.69, inferior a la de los dos modelos de boosting (0.74 y 0.75). Lo que indica que el modelo es menos efectivo al clasificar correctamente ambas clases y es más probable que genere errores.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+prob_test4 <- predict(modelo_cost, test) 
+
+# Crear el objeto prediction con las predicciones sobre el conjunto de test
+pred4 <- prediction(predictions = as.numeric(prob_test4), labels = test$default)  
+
+# Extraer TPR y FPR para la curva ROC
+perf4 <- performance(pred4, measure = "tpr", x.measure = "fpr") 
+
+# Convertir los valores en un data frame para graficar
+roc_data4 <- data.frame(fpr = unlist(perf4@x.values),   
+                        tpr = unlist(perf4@y.values)) 
+
+# Graficar la curva ROC con ggplot2
+ggplot(roc_data4, aes(x = fpr, y = tpr)) +   
+  geom_line(color = "royalblue3", linewidth = 1.1) +   
+  geom_abline(linewidth = 1.1, slope = 1, intercept = 0, linetype = "dashed", color = "firebrick") +   
+  labs(title = "Curva ROC del Modelo sensible a costes", x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)") +   
+  theme_light()
+
+
+
+```
+
+Aunque este modelo presenta una mejor capacidad para identificar los casos de *Default*, lo hace a costa de errar en la detección de *No-Default*, empeorando su acierto global con respecto a los modelos de boosting. Aunque la detección errónea de préstamos *Default* como *No-Default* implica una pérdida económica superior, habría que estudiar la pérdida o beneficio económico que implica la clasificación de cada modelo.
+
+## Estrategia agresiva o conservadora basada en los outputs obtenidos
+
+Según el objetivo deseado, es posible optar por estrategias agresivas o conservadoras, buscando un equilibrio entre sensibilidad (capacidad del modelo para detectar correctamente los casos de *Default*) y especificidad (capacidad para identificar adecuadamente los casos de *No-Default*). Esta idea ha podido visualizar previamente, pero ahora se analizarán con mayor profundidad.
+
+#### **Estrategia agresiva**
+
+La implementación de una estrategia agresiva sigue un enfoque dirigido a maximizar las ganancias, aun aceptando un mayor riesgo en la concesión de créditos. Estas son las medidas que se pueden seguir para implementar esta estrategia:
+
+**Ajuste del umbral de decisión**: Reducir el umbral de probabilidad para permitir que un número mayor de solicitantes sea clasificado como “*No-Default*”. Esta modificación aumentará la especificidad del modelo, aunque a costa de disminuir la sensibilidad, lo que resulta en una mayor aprobación de préstamos, incluso para aquellos con un considerable riesgo de incumplimiento. Así, se busca aumentar la cantidad de aprobaciones, aunque ello signifique trabajar con clientes de alto riesgo.
+
+**Monitoreo activo**: Supervisar a los clientes a los que se les ha otorgado un crédito, a través de recordatorios regulares sobre los vencimientos, con el objetivo de reducir el riesgo de incumplimiento y fomentar el cumplimiento en los pagos.
+
+**Incentivos para clientes de alto riesgo**: Considerar incentivos especiales para mantener el compromiso de los clientes con un perfil de mayor riesgo, como plazos de pago extendidos o tasas de interés más bajas, facilitando así su cumplimiento y fomentando la lealtad.
+
+#### **Estrategia conservadora**
+
+En contraste, una estrategia más conservadora, como puede ser el último modelo de clasificación, se centra en la seguridad y en la reducción del riesgo asociado a las operaciones crediticias. Estas son las medidas que se pueden seguir para implementar esta estrategia:
+
+**Ajuste del umbral de decisión**: Incrementar el umbral de probabilidad de tal manera que solo aquellos solicitantes considerados de bajo riesgo sean clasificados como “*No-Default*”. Este enfoque pone énfasis en la sensibilidad en lugar de la especificidad, resultando en un proceso de aprobación más exhaustivo y selectivo.
+
+**Criterios de aprobación más rigurosos**: Implementar estándares de aprobación más estrictos, lo que reducirá la tasa de aceptación de solicitudes de crédito. Esto asegura un análisis detallado de cada solicitud, minimizando así el riesgo de incumplimientos.
+
+**Reserva de capital adicional**: Establecer un fondo de reserva adicional que permita mitigar el impacto financiero de eventuales incumplimientos. Esta reserva funcionará como un colchón para cubrir pérdidas inesperadas, garantizando la estabilidad de la institución.
+
+**Fidelización de clientes**: Fomentar relaciones a largo plazo con los clientes, cultivando la lealtad y la confianza. Esta fidelización puede ayudar a reducir el riesgo y mejorar la calidad de la cartera de préstamos, lo que asegurará un crecimiento sostenible.
+
+## Cómo guiar estas estrategias durante el proceso de ajuste de los modelos
+
+Para guiar las estrategias agresiva y conservadora durante el proceso de ajuste de los modelos, se debe poner especial atención a cómo cada ajuste puede respaldar los objetivos estratégicos de la empresa. Este enfoque orientado permitirá que los modelos se optimicen en función de la sensibilidad o especificidad, según los requerimientos de la estrategia seleccionada.
+
+#### **Guía para la estrategia agresiva**
+
+La estrategia agresiva, que busca aumentar aprobaciones y maximizar ingresos, como ya se ha dicho se beneficiará de ajustes que prioricen especificidad y que permitan al modelo aprobar más solicitudes, incluso si ello implica mayor riesgo. Para implementar esta estrategia en el ajuste del modelo, se pueden seguir varios lineamientos:
+
+**Optimización del Umbral de Decisión**: Se sabe que hay que reducir el umbral de probabilidad para clasificar como No-Default, permitiendo así un mayor flujo de aprobaciones. Para guiar esta optimización, se debe realizar un análisis de sensibilidad de diferentes umbrales y evaluar cómo cada ajuste afecta las tasas de aprobación y la proporción de posibles incumplimientos. Esto permite visualizar el impacto real en la cartera crediticia y ajustar los niveles de riesgo aceptables.
+
+**Ajuste de Hiperparámetros**: El ajuste de hiperparámetros debe enfocarse en maximizar la capacidad predictiva del modelo para captar casos de Default sin reducir de manera crítica la especificidad. En modelos como boosting, incrementar el número de árboles o ajustar la tasa de aprendizaje puede ayudar a capturar patrones en clientes de riesgo medio. Este ajuste debe guiarse por experimentación, probando diferentes valores para encontrar la combinación que permita identificar clientes con alto potencial de pago, aunque tengan riesgo de incumplimiento.
+
+**Implementación de Validación Cruzada y Monitoreo Activo**: Para mantener el rendimiento del modelo en el tiempo, es fundamental aplicar validación cruzada con datos de diferentes periodos, asegurando así que los ajustes sean consistentes y que la tendencia hacia una mayor especificidad no afecte demasiado la sensibilidad. Esto facilita una revisión constante de los resultados y permite alinear el modelo con los objetivos de crecimiento de la cartera, promoviendo ajustes en tiempo real en función del comportamiento observado.
+
+
+#### **Guía para la estrategia conservadora**
+
+En una estrategia conservadora, ya se ha visto que el enfoque se centra en minimizar riesgos y preservar la calidad de la cartera. Los ajustes del modelo deben priorizar sensibilidad, identificando posibles Defaults con alta precisión. Para guiar esta estrategia, el proceso de ajuste de modelos puede incluir:
+
+**Establecimiento de Umbrales Elevados de Decisión**: Aquí, el ajuste para aumentar el umbral de clasificación a niveles que aseguren que solo aquellos con un perfil de riesgo bajo sean aprobados se debe guiar por un análisis de la distribución de probabilidad de incumplimiento, revisando que el aumento del umbral reduce significativamente los posibles Defaults mientras se mantiene una tasa de aprobación adecuada para las metas de cartera conservadora.
+
+**Ajustes en los Parámetros de Regularización**: Utilizar técnicas de regularización que penalicen la complejidad excesiva del modelo, como la regularización L1 o L2, puede ayudar a evitar sobreajuste y permitir que el modelo capture solo las características más relevantes para la clasificación de bajo riesgo. Además, limitar la profundidad de los árboles o la cantidad de variables seleccionadas en cada iteración puede resultar en un modelo más selectivo, ideal para una estrategia conservadora. Estas decisiones deben estar respaldadas por análisis de métricas de especificidad en pruebas con datos históricos y actuales.
+
+**Evaluación Dinámica y Reserva de Capital**: Dado que la estrategia conservadora pone énfasis en la estabilidad a largo plazo, se recomienda un sistema de monitoreo de desempeño a través de métricas de sensibilidad y especificidad, asegurando que los resultados del modelo se mantengan alineados con la capacidad de cobertura de la empresa. Además, realizar ajustes periódicos en los umbrales de probabilidad y características seleccionadas puede ayudar a mantener el modelo en equilibrio con el riesgo del mercado y permitir reservar capital adicional para cubrir potenciales pérdidas.
+
+**Experimentación Controlada en la Selección de Características**: La selección de características es crítica en una estrategia conservadora. Aquí se pueden implementar pruebas controladas donde solo se utilicen variables con alta correlación con el comportamiento de pago a largo plazo, dejando fuera aquellas de correlación baja o ambigua. Esto asegura que el modelo conserve su precisión en perfiles de bajo riesgo, lo cual es clave para mantener una cartera con menos exposición al riesgo.
+
+
+#### **Monitoreo y mejora continua para ambas estrategias**
+
+Independientemente de la estrategia seleccionada, es fundamental guiar el proceso de ajuste mediante una mejora continua para asegurar que el modelo se mantenga relevante, lo cual incluye la evaluación periódica de métricas clave (como ROC AUC, sensibilidad y especificidad) y revisiones del impacto en la cartera crediticia de cada ajuste implementado. Además, el modelo debe reentrenarse regularmente con datos recientes para adaptarse a cambios en el mercado y en el comportamiento de los clientes, mientras que los umbrales y parámetros deben ajustarse según el ciclo económico, permitiendo así incrementar aprobaciones en períodos de bajo riesgo y restringirlas en entornos de alta incertidumbre económica.
+
+
+## Threshold para maximizar beneficios y rentabilidad
+
+Se ajusta el modelo de clasificación sensible a costos para maximizar los beneficios y calcular la rentabilidad de un préstamo de 1000 unidades monetarias, dado que el tipo de interés de los préstamos es del 25% y las pérdidas en caso de default son del 60% del crédito concedido. El objetivo es encontrar el umbral (threshold) que maximice los beneficios y, a partir de allí, calcular la rentabilidad de este modelo.
+
+Primero, se define el conjunto de parámetros económicos. A continuación, se estima un modelo sensible a costos utilizando la técnica de clasificación C5.0, incorporando una matriz de costos que refleja los beneficios y pérdidas asociados a las distintas decisiones del modelo (aprobación o rechazo del préstamo). El modelo se ajusta utilizando los datos de entrenamiento, y luego se generan predicciones binarias para el conjunto de test. Para evaluar el impacto de diferentes umbrales de decisión en los beneficios, se simula un rango de umbrales (de 0 a 1). Para cada umbral, se calculan los beneficios netos sumando los ingresos por los préstamos sin default y restando las pérdidas por los préstamos con default. El umbral que maximiza los beneficios se identifica, y a partir de ahí, se calcula la rentabilidad total, que refleja el beneficio neto en relación con el total de crédito otorgado. Finalmente, se presentan los resultados del umbral óptimo, el beneficio neto máximo y la rentabilidad asociada.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Threshold
+
+
+# Parámetros económicos
+monto_credito <- 1000  # Crédito concedido
+tasa_interes <- 0.25   # Tasa de interés
+perdida_default <- 0.60 * monto_credito  # Pérdida por default (60% del crédito)
+ingreso_no_default <- monto_credito * tasa_interes  # Ingreso por No-Default (25% del crédito)
+
+# Estimación del Modelo con costos
+error_cost_thr <- matrix(c(-250, 250, -600, 0), nrow = 2)
+
+modelo_cost_thr <- C5.0(subset(train, select = -default),
+                        train$default, costs = error_cost_thr)
+
+# Predicciones binarias para el conjunto de test (sin probabilidades)
+prediccion_test_binaria <- predict(modelo_cost_thr, test)  # Predicciones de clases: No-Default o Si-Default
+
+# Convertimos las predicciones a valores binarios: 1 = Default (Si-Default), 0 = No-Default
+predicciones_binarias <- ifelse(prediccion_test_binaria == "Si-Default", 1, 0)
+
+# Rango de umbrales a evaluar (de 0 a 1)
+umbrales <- seq(0, 1, by = 0.01)
+
+# Inicialización de las variables para el umbral y beneficio
+mejor_beneficio <- -Inf
+mejor_umbral <- 0
+
+# Inicialización para el cálculo de rentabilidad
+total_credito_otorgado <- 0
+total_beneficio_neto <- 0
+
+# Evaluar los beneficios para cada umbral
+for (umbral in umbrales) {
+  
+  # Convertir las probabilidades en predicciones binarias según el umbral
+  # Pero como no tenemos probabilidades, solo usamos las predicciones binarias
+  predicciones_binarias_umbral <- ifelse(predicciones_binarias >= umbral, 1, 0)
+  
+  # Calcular el beneficio neto para el umbral actual
+  # Si el cliente no hace default, el beneficio es el ingreso por interés
+  # Si hace default, el beneficio es la pérdida (60% del crédito)
+  beneficio_neto <- sum(predicciones_binarias_umbral == 0) * ingreso_no_default -  # Ingresos por No-Default
+    sum(predicciones_binarias_umbral == 1) * perdida_default   # Pérdidas por Default
+  
+  # Actualizar el umbral si el beneficio neto es mayor
+  if (beneficio_neto > mejor_beneficio) {
+    mejor_beneficio <- beneficio_neto
+    mejor_umbral <- umbral
+  }
+  
+  # Acumulamos el total de crédito otorgado para rentabilidad
+  total_credito_otorgado <- total_credito_otorgado + length(test$default) * monto_credito
+  total_beneficio_neto <- total_beneficio_neto + beneficio_neto
+}
+
+# Calcular la rentabilidad
+rentabilidad <- total_beneficio_neto / total_credito_otorgado
+
+# Mostrar los resultados
+cat("El umbral óptimo para maximizar beneficios es:", mejor_umbral, "\n")
+cat("El beneficio neto máximo es:", mejor_beneficio, "\n")
+cat("La rentabilidad es:", rentabilidad, "\n")
+
+
+
+```
+
+
+El modelo sensible a costes ha identificado un umbral óptimo de 0.01, lo que implica que clasifica como "default" a aquellos clientes con una probabilidad de incumplimiento superior al 1%. Esto permite maximizar los beneficios netos, alcanzando un valor máximo de 25,000 unidades monetarias. La rentabilidad, que se calcula como el beneficio neto sobre el crédito otorgado, es de 0.2416, lo que indica que por cada unidad monetaria concedida se obtiene un beneficio neto de aproximadamente 24%. Este resultado refleja una estrategia conservadora, priorizando la minimización de pérdidas por default, lo que, a pesar de reducir algunos ingresos por intereses, genera una rentabilidad sólida y eficiente en función del crédito otorgado.
+
+
+## Sesgo más importante para ajustar un modelo de concesión de préstamos
+
+El sesgo más importante que presentan los datos utilizados por las entidades financieras para ajustar un modelo de concesión de préstamos es el sesgo en la representación de la clase minoritaria, que en este caso se refiere a los clientes que realmente incumplen con el pago de los préstamos (los "defaults"). En muchas situaciones, los incumplimientos son menos frecuentes que los préstamos que se pagan a tiempo, lo que genera una desproporción entre las clases en los datos, es decir, hay muchos más casos de clientes que no hacen default que de los que sí lo hacen.
+
+Este desequilibrio de clases puede llevar a que el modelo aprenda a predecir principalmente la clase mayoritaria (en este caso, "no-default") y, por lo tanto, subestime o no detecte adecuadamente los casos de incumplimiento. Esto puede resultar en un modelo que tiene un rendimiento pobre en la predicción de defaults, lo cual es crítico para las entidades financieras, ya que no detectar adecuadamente a los clientes con mayor riesgo de incumplimiento puede implicar pérdidas financieras significativas. Para mitigar este sesgo, las entidades financieras pueden utilizar técnicas como la re-muestreo de los datos, la utilización de pesos en las clases, o la aplicación de modelos de coste sensible, como los que se ha trabajado en este ejercicio, que buscan optimizar la detección de los defaults sin dejar de lado la rentabilidad.
